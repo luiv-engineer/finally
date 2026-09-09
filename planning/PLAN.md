@@ -454,3 +454,108 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Review Notes — Questions, Clarifications & Simplifications
+
+*Added by a documentation review pass on 2026-09-08. Grounded against the plan as written and the market data subsystem already built in `backend/app/market/`. Items are grouped by how much they block downstream agents. Nothing here has been changed in the spec above — these are proposals and questions for the plan's owner.*
+
+### 13.1 Blocking Decisions (a downstream agent cannot proceed without an answer)
+
+**Q1 — "Daily change %" has no data source.**
+§2 and §10 both require a daily change % in the watchlist, but the price model that exists (`PriceUpdate` in `backend/app/market/models.py`) only computes `change` / `change_percent` against the *previous tick* — roughly 500ms ago in the simulator, 15s ago via Massive. Those numbers will be near-zero noise, not a daily change. There is no stored session open or previous close anywhere in the schema or the cache.
+
+Three options, please pick one:
+- (a) Add `open_price` to `PriceUpdate` / `PriceCache`. Simulator uses `SEED_PRICES` as the day's open; Massive uses the snapshot's `todaysChangePerc` / previous-close field. Change % = change from open. **Recommended** — matches user expectation and is a small change to an already-tested module.
+- (b) Capture the first price the process ever sees per ticker as the session baseline. Cheaper, but "daily" change resets whenever the container restarts.
+- (c) Drop "daily" from the spec and display tick-to-tick change. Simplest, but the column will read 0.00% almost always.
+
+**Q2 — Can the user hold a position in a ticker that is not on the watchlist?**
+The plan never says. This matters because `remove_ticker()` in the existing `MarketDataSource` contract *also removes the ticker from the PriceCache*. So today, removing NVDA from the watchlist while holding 10 shares of NVDA silently deletes its price, and the portfolio can no longer be valued. Options:
+- (a) The set of tracked tickers is `union(watchlist, open positions)`. Watchlist removal only removes from the cache if no position is held. **Recommended.**
+- (b) Reject watchlist removal while a position is open (`409`).
+- (c) Force-close the position on removal. (Surprising; not recommended.)
+
+Whichever is chosen, §8 should state explicitly that `POST /api/watchlist` calls `source.add_ticker()` and `DELETE /api/watchlist/{ticker}` calls `source.remove_ticker()` — right now the API section and the market data section don't reference each other at all.
+
+**Q3 — What happens when an unknown ticker is added?**
+`seed_prices.py` only has parameters for the 10 default tickers. If the user (or the LLM, via `watchlist_changes`) adds `PYPL` — the plan's own example — or a typo like `APPL`, what happens in simulator mode? Is there a validation list, or does an unknown ticker get a randomly generated seed price and default GBM params? The LLM can invent symbols, so this path *will* be hit in the demo. Please specify: reject with a `400` against an allowlist, or accept anything and synthesize a seed. Note this behavior also differs by data source (Massive would return nothing for a bogus symbol), so the plan should say whether the two modes are allowed to diverge here.
+
+**Q4 — Trade execution when no price is cached.**
+Market orders fill "instantly at current price". If a ticker was just added and `PriceCache.get_price()` returns `None` (guaranteed for up to 15s in Massive mode), what does `POST /api/portfolio/trade` do? Suggest an explicit `409` with a "price not available yet" message, and the same guard on LLM-initiated trades.
+
+**Q5 — The LLM error-reporting loop is not closed.**
+§9 says "If a trade fails validation, the error is included in the chat response so the LLM can inform the user." But by the time trades execute (step 6), the LLM has already produced its message (step 4) — there is no second call. So the LLM cannot inform the user about a failure it never saw. Pick one:
+- (a) The failure is returned as structured data in the `actions` payload and the **frontend** renders it inline (e.g. a red "Buy 10 AAPL — failed: insufficient cash" row). **Recommended** — no extra latency or token cost.
+- (b) A second LLM round-trip on failure, so the assistant can apologize and re-plan. Doubles worst-case latency.
+
+Related: if the LLM returns multiple trades, is execution **ordered** (a sell funding a subsequent buy) and is it **all-or-nothing or best-effort**? Please state both. Suggest: sequential in array order, best-effort, each result recorded individually.
+
+### 13.2 Clarifications Needed (unblocked, but ambiguous enough to cause rework)
+
+**C1 — SSE payload shape.** §6 describes an event as containing "ticker, price, previous price, timestamp, and change direction" — singular. The implemented endpoint emits **all tickers in one event**, as `{"AAPL": {...}, "GOOGL": {...}}`. The plan should record the actual shape, since the Frontend agent will code against this text. Also worth documenting: the stream is **change-triggered** (a version counter is polled every 500ms), not a fixed 500ms heartbeat, so in Massive mode a client sees roughly one event every 15 seconds.
+
+**C2 — Chart history has no source, and the plan may be underestimating this.** §2 states sparklines accumulate on the frontend from SSE "since page load", and §10 asks for a main chart of "price over time" for the selected ticker. There is no price-history table and no history endpoint. Consequences as specified: every page refresh empties every chart, the "larger detailed chart" is blank for the first minute, and in Massive mode it gains 4 points per minute. If a populated chart on first paint matters to the demo, the cheapest fix is a server-side ring buffer (last N prices per ticker, in memory alongside `PriceCache`) plus `GET /api/history/{ticker}` — no schema change, no persistence. Please confirm whether empty-on-load is acceptable or the buffer should be added.
+
+**C3 — P&L chart on a fresh database.** Snapshots are written every 30s and after each trade, so a brand-new user stares at a chart with zero or one point. Suggest seeding one snapshot at `total_value = 10000.0` during DB initialization.
+
+**C4 — Position lifecycle on a full sell.** §7 says one row per ticker; the E2E scenarios say a position "updates or disappears". Pick one: delete the row at quantity 0, or keep it at 0 and filter in the API. This changes both the positions table and the heatmap.
+
+**C5 — P&L definitions.** The plan only ever mentions *unrealized* P&L. If a user buys, the price rises, and they sell everything, that gain becomes cash and disappears from every P&L display. Please define the header figure explicitly — suggest `total_value = cash + Σ(qty × price)` and `total_return = total_value − 10000`, stated in the spec so the Backend and Frontend agents compute the same number. Also confirm no `realized_pnl` is being tracked (the schema has no column for it).
+
+**C6 — Numeric rules.** Fractional shares are supported, so please state: minimum trade quantity (reject `0` and negatives?), rounding of cash (2dp?), and rounding of quantity. `PriceCache` already rounds prices to 2dp, which is worth noting in §6 since it means `avg_cost` will carry more precision than any displayed price.
+
+**C7 — `chat_messages.actions` JSON shape is undefined.** The frontend renders these inline, so the shape is a cross-agent contract and belongs in §9 next to the request schema. Suggest including per-action status, e.g. `{"trades": [{"ticker": "AAPL", "side": "buy", "quantity": 10, "price": 190.12, "status": "ok"}], "watchlist_changes": [{"ticker": "PYPL", "action": "add", "status": "error", "error": "unknown ticker"}]}`.
+
+**C8 — Conversation history is unbounded.** §9 step 2 says "recent conversation history" without a limit; over a long demo this grows without bound. Suggest an explicit cap (last 20 messages) written into the spec.
+
+**C9 — `LLM_MOCK=true` needs a defined contract.** The E2E scenario "send a message, receive a response, trade execution appears inline" requires the mock to actually *return a trade*, which means it must be keyed off the input rather than returning one constant. Suggest specifying a small keyword table (e.g. a message containing "buy" returns a buy of 1 share of the first watchlist ticker) so the Testing and Backend agents agree.
+
+**C10 — Structured output support on the chosen route.** §9 mandates Structured Outputs via `openrouter/openai/gpt-oss-120b` with Cerebras. Please confirm that route supports a JSON-schema `response_format`; if it only honors JSON mode, the spec should name the fallback (prompt-instructed JSON + Pydantic validation + one retry on parse failure). Worth pinning now because "always respond with valid structured JSON" in §9 is currently an instruction, not a guarantee.
+
+**C11 — SQLite concurrency.** SSE connections, trade requests, and the 30-second snapshot task all touch the database from different threads/tasks. The plan should state the access rule — suggest WAL mode enabled at init, and either a single connection guarded by a lock or a connection per request. This is a classic source of `database is locked` errors under exactly this shape of workload.
+
+**C12 — Connection status semantics.** Green/yellow/red is specified but `EventSource` only exposes `CONNECTING`/`OPEN`/`CLOSED`, and it retries indefinitely — so "red = disconnected" may never trigger. Suggest defining it in terms of observed behavior: green = event received within the last N seconds, yellow = `CONNECTING` or no event for N seconds, red = `CLOSED`. Note the "no event received" threshold has to differ between simulator (~500ms) and Massive (~15s) modes, or Massive mode will sit on yellow permanently.
+
+**C13 — Chat request timeout.** §9 relies on Cerebras being "fast enough that a loading indicator is sufficient", but no timeout is specified for `POST /api/chat` on either side. Suggest a server-side timeout with a graceful error message.
+
+### 13.3 Internal Inconsistencies
+
+**I1 — The Docker volume section contradicts itself.** §11 says "The `db/` directory in the project root maps to `/app/db`", but the command directly above it mounts a **named volume** (`-v finally-data:/app/db`), which does *not* map the project's `db/` directory — the file would live inside Docker's volume storage and never appear in the repo. §4 compounds this by calling root `db/` the "volume mount target" with a `.gitkeep`. Please pick one and make all three places agree: a bind mount (`-v "$(pwd)/db:/app/db"`, host-visible, matches §4) or a named volume (delete the root `db/` directory from §4).
+
+**I2 — Two different directories named `db`.** `backend/db/` (schema SQL and seed logic — source code) and root `db/` (the runtime SQLite file) will be a recurring source of confusion for both agents and students. Suggest renaming: schema/seed to `backend/app/db/`, runtime directory to `data/`.
+
+**I3 — The database path needs to be configurable.** §7 hardcodes `db/finally.db`, but the backend runs from `backend/` in local development and from `/app` in the container, so a single relative path can't work in both. Add a `DATABASE_PATH` environment variable to §5 with a sensible default.
+
+**I4 — Static file serving order is unspecified.** §3 shows `/*` serving the Next.js export and `/api/*` serving the API. With a catch-all mount, registration order determines whether API routes are shadowed. Worth one sentence in §11: API routers registered first, static mount last, plus how Next.js client-side routes resolve (the export produces `.html` files; confirm whether a SPA-style fallback to `index.html` is needed).
+
+### 13.4 Simplification Opportunities
+
+**S1 — Add one bootstrap endpoint; drop prices from the watchlist response.** Today a page load needs `/api/watchlist` + `/api/portfolio` + `/api/portfolio/history`, and every trade invalidates two of them. A single `GET /api/state` returning cash, positions, watchlist, and total value collapses that to one call on load and one after each trade. Simultaneously, having `/api/watchlist` return "latest prices" (§8) creates a second source of price truth alongside SSE, with no rule for which wins. Suggest: prices come **only** from SSE, and `/api/state` returns a one-time price snapshot purely for first paint. Net effect: fewer endpoints and one fewer class of stale-data bug.
+
+**S2 — Commit to a single charting library.** §10 offers "Lightweight Charts or Recharts". These aren't interchangeable for this UI: the portfolio heatmap is a treemap, which Lightweight Charts does not provide. Naming one library that covers all four visualizations (watchlist sparkline, main price chart, treemap, P&L line) avoids shipping two charting dependencies. Recharts covers all four; Lightweight Charts would need a second library for the treemap.
+
+**S3 — Run Playwright from the host instead of a second container.** §12 specifies a `docker-compose.test.yml` spinning up the app plus a Playwright container. Running Playwright on the host against the already-running app container achieves the same isolation goal (browser deps stay out of the production image) with no compose file, no second image to build, and a much better local debugging story (`--headed`, `--ui`). The compose file is only worth it if CI cannot install browsers, which is worth confirming before building it.
+
+**S4 — Drop derived fields from the SSE payload.** Each event currently carries `change`, `change_percent`, and `direction` alongside `price` and `previous_price` — all three are trivially derivable client-side, and they're sent for every ticker on every tick. Minor, but it roughly shrinks the payload by a third on the hottest path in the app. (If Q1 lands on option (a), `open_price` should be added *instead of* these.)
+
+**S5 — Specify the "SSE resilience" test concretely, or cut it.** "Disconnect and verify reconnection" is meaningfully hard to drive from Playwright (it needs CDP network manipulation or route interception). Either specify the mechanism in §12 or drop it to a manual smoke check — as written it's the scenario most likely to burn an agent's time for the least demo value.
+
+**S6 — `create_stream_router()` currently uses a module-level router.** In `backend/app/market/stream.py` the factory decorates a router defined at module scope, so calling it twice would register the route twice on a shared object. Only matters if the app is ever constructed more than once in a process — which is exactly what a FastAPI test fixture does. Cheap fix: build the `APIRouter` inside the factory. Flagged here because §6 is the spec for that module.
+
+### 13.5 Doc / Repo Drift
+
+These aren't errors in the plan — the plan is the target — but the gaps are worth stating so nobody assumes they exist:
+
+- §4's tree shows `frontend/`, `scripts/`, `test/`, and root `db/`. **None exist yet**; only `backend/` has been built. §4 is aspirational and should probably say so.
+- §5 and §4 refer to a committed `.env.example`. **It does not exist.** Worth creating early, since it's the first thing a student touches.
+- `backend/db/` (schema and seed logic, per §4) **does not exist yet** — the database layer is entirely unbuilt.
+- `backend/pyproject.toml` does not yet include `litellm` or a dotenv loader, both of which §5 and §9 require.
+- `MARKET_DATA_SUMMARY.md` documents `PriceUpdate` as carrying a `change` field; it is a computed property, not a stored field. Harmless, but the summary reads as though it's stored.
+
+### 13.6 Smaller Suggestions
+
+- **`GET /api/health` could carry more.** Returning the active market data source (`"simulator"` / `"massive"`), whether the background task is alive, and the ticker count makes the mode instantly visible during a demo and gives the E2E suite something cheap to assert.
+- **State the trade-input validation surface.** The trade bar takes a free-text ticker; specify whether it must already be on the watchlist, and whether a successful trade auto-adds it. (This interacts with Q2.)
+- **Selecting a ticker for the main chart** — worth stating the default selection on first load (suggest: first watchlist entry) so the chart area is never empty.
