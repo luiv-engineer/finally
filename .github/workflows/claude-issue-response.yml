@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       issues: write
+      pull-requests: write
       contents: read
 
     steps:
@@ -28,30 +29,32 @@ jobs:
         if: steps.check_mention.outputs.mentioned == 'true'
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
+            console.log('Workflow triggered for @claude mention');
+            console.log('Issue/PR number:', context.issue.number);
+
             const issue_number = context.issue.number;
             const repo = context.repo.repo;
             const owner = context.repo.owner;
 
             const body = github.event.issue?.body || github.event.comment?.body || '';
+            console.log('Body contains @claude:', body.includes('@claude'));
 
-            // Create a response comment
-            github.rest.issues.createComment({
-              owner: owner,
-              repo: repo,
-              issue_number: issue_number,
-              body: `👋 Hey! I see you've mentioned @claude.
+            const responseBody = '👋 Hey! I see you mentioned @claude.\n\nI am here to help! The Claude GitHub App is installed and ready to assist with:\n- 🔍 Analyzing code and issues\n- 🐛 Fixing CI errors\n- 📝 Reviewing pull requests\n- 🤖 Responding to development tasks\n\nPlease describe what you need help with, and I will get started!';
 
-To get Claude to help with this issue, I'm setting up a workflow to process your request. Please wait a moment...
-
-**Note**: The Claude GitHub App is installed and ready to help with:
-- 🔍 Analyzing pull requests and issues
-- 🐛 Fixing CI errors
-- 📝 Reviewing code changes
-- 🤖 Responding to development tasks
-
-Feel free to open a pull request or check back on this issue for updates!`
-            });
+            try {
+              const comment = await github.rest.issues.createComment({
+                owner: owner,
+                repo: repo,
+                issue_number: issue_number,
+                body: responseBody
+              });
+              console.log('Comment created successfully:', comment.data.id);
+            } catch (error) {
+              console.error('Error creating comment:', error);
+              throw error;
+            }
 
       - name: Log issue details
         if: steps.check_mention.outputs.mentioned == 'true'
