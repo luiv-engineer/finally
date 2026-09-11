@@ -49,6 +49,27 @@ class TestPriceCache:
         cache = PriceCache()
         cache.remove("AAPL")  # Should not raise
 
+    def test_remove_increments_version(self):
+        """Test that removing a ticker bumps the version counter.
+
+        SSE change detection relies on this: without it, a ticker removed
+        from the watchlist would keep appearing in already-connected clients'
+        streams until some other ticker happened to update.
+        """
+        cache = PriceCache()
+        cache.update("AAPL", 190.00)
+        v_before = cache.version
+        cache.remove("AAPL")
+        assert cache.version == v_before + 1
+
+    def test_remove_nonexistent_does_not_bump_version(self):
+        """Test that removing an unknown ticker is a true no-op, version included."""
+        cache = PriceCache()
+        cache.update("AAPL", 190.00)
+        v_before = cache.version
+        cache.remove("NOPE")
+        assert cache.version == v_before
+
     def test_get_all(self):
         """Test getting all prices."""
         cache = PriceCache()
