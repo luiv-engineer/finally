@@ -209,3 +209,25 @@ __marimo__/
 # Codex Stop-hook review output (local only)
 .claude/codex-reviews/
 .claude/settings.local.json
+
+# FinAlly runtime data
+data/*.db
+data/*.db-wal
+data/*.db-shm
+.env
+
+# Node / Next.js (frontend + Playwright E2E)
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+.eslintcache
+npm-debug.log*
+yarn-error.log*
+
+# Playwright
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/

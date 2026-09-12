@@ -1,1 +1,0 @@
-give me an idea of a command that you think is useful for software-engineers? im learning how to work with you.
